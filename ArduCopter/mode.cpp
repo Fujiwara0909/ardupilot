@@ -41,6 +41,9 @@ Mode *Copter::mode_from_mode_num(const Mode::Number mode)
         case Mode::Number::STABILIZE:
             return &mode_stabilize;
 
+        case Mode::Number::CEILING:
+            return &mode_ceiling;
+
         case Mode::Number::ALT_HOLD:
             return &mode_althold;
 
