@@ -72,6 +72,11 @@ private:
     uint32_t frame_counter;
     double last_timestamp_s;
 
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    // True once the existing FDM acceptance path has completed at least once.
+    bool initial_fdm_received = false;
+#endif
+
     void output_servos(const struct sitl_input &input);
     void recv_fdm(const struct sitl_input &input);
 

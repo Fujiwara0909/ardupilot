@@ -302,8 +302,19 @@ uint64_t JSON::parse_sensors(const char *json)
 */
 void JSON::recv_fdm(const struct sitl_input &input)
 {
+    const auto receive_sensor_packet = [this]() -> ssize_t {
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+        if (!initial_fdm_received) {
+            // Allow startup connection waits, with margin over the 100ms receive timeout.
+            EXPECT_DELAY_MS(1000);
+            return sock.recv(&sensor_buffer[sensor_buffer_len], sizeof(sensor_buffer)-sensor_buffer_len, UDP_TIMEOUT_MS);
+        }
+#endif
+        return sock.recv(&sensor_buffer[sensor_buffer_len], sizeof(sensor_buffer)-sensor_buffer_len, UDP_TIMEOUT_MS);
+    };
+
     // Receive sensor packet
-    ssize_t ret = sock.recv(&sensor_buffer[sensor_buffer_len], sizeof(sensor_buffer)-sensor_buffer_len, UDP_TIMEOUT_MS);
+    ssize_t ret = receive_sensor_packet();
     uint32_t wait_ms = UDP_TIMEOUT_MS;
 
     if (state.no_lockstep && ret <= 0) {
@@ -320,7 +331,7 @@ void JSON::recv_fdm(const struct sitl_input &input)
 
     while (ret <= 0) {
         //printf("No JSON sensor message received - %s\n", strerror(errno));
-        ret = sock.recv(&sensor_buffer[sensor_buffer_len], sizeof(sensor_buffer)-sensor_buffer_len, UDP_TIMEOUT_MS);
+        ret = receive_sensor_packet();
         wait_ms += UDP_TIMEOUT_MS;
         // if no sensor message is received after 10 second resend servos, this help cope with SITL and the physics getting out of sync
         if (wait_ms > 1000) {
@@ -525,6 +536,10 @@ void JSON::recv_fdm(const struct sitl_input &input)
     }
     last_timestamp_s = state.timestamp_s;
     frame_counter++;
+
+#if AP_SIM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    initial_fdm_received = true;
+#endif
 
 #if 0
 
