@@ -32,6 +32,11 @@
 #include <SRV_Channel/SRV_Channel.h>
 #include <AP_Filesystem/AP_Filesystem.h>
 
+#if AP_SIM_JSON_SERIAL_ENABLED
+#include <AP_SerialManager/AP_SerialManager.h>
+#include <GCS_MAVLink/GCS.h>
+#endif
+
 #define UDP_TIMEOUT_MS 100
 
 extern const AP_HAL::HAL& hal;
@@ -61,8 +66,10 @@ static const struct {
 
 
 JSON::JSON(const char *frame_str) :
-    Aircraft(frame_str),
-    sock(true)
+    Aircraft(frame_str)
+#if !AP_SIM_JSON_SERIAL_ENABLED
+    , sock(true)
+#endif
 {
     printf("Starting SITL: JSON\n");
 
@@ -88,6 +95,7 @@ JSON::JSON(const char *frame_str) :
 */
 void JSON::set_interface_ports(const char* address, const int port_in, const int port_out)
 {
+#if !AP_SIM_JSON_SERIAL_ENABLED
     sock.set_blocking(false);
     sock.reuseaddress();
 
@@ -97,8 +105,147 @@ void JSON::set_interface_ports(const char* address, const int port_in, const int
     control_port = port_out;
 
     printf("JSON control interface set to %s:%u\n", target_ip, control_port);
+#endif
 }
 
+#if AP_SIM_JSON_SERIAL_ENABLED
+void JSON::init_serial()
+{
+    if (serial_init_attempted) {
+        return;
+    }
+    serial_init_attempted = true;
+
+    auto &sm = AP::serialmanager();
+    const auto *port_state = sm.get_state_by_id(7);
+    auto *uart = sm.get_serial_by_id(7);
+    if (port_state == nullptr || uart == nullptr) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SIM_JSON: SERIAL7 unavailable");
+        return;
+    }
+    if (port_state->get_protocol() != AP_SerialManager::SerialProtocol_None) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SIM_JSON: SERIAL7_PROTOCOL must be -1");
+        return;
+    }
+
+    AP_HAL::UARTDriver *port1 = nullptr;
+    AP_HAL::UARTDriver *port2 = nullptr;
+    uint8_t timeout_s;
+    uint32_t baud1, baud2;
+    if (sm.get_passthru(port1, port2, timeout_s, baud1, baud2) &&
+        (port1 == uart || port2 == uart)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SIM_JSON: SERIAL7 used by passthrough");
+        return;
+    }
+    if (!uart->lock_port(serial_lock_key, serial_lock_key)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SIM_JSON: SERIAL7 already locked");
+        return;
+    }
+
+    // Called from update(), after SerialManager init, to own RX on the main thread.
+    uart->begin_locked(port_state->baudrate(), 4096, 1024, serial_lock_key);
+    if (!uart->is_initialized()) {
+        uart->lock_port(0, 0);
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SIM_JSON: SERIAL7 init failed");
+        return;
+    }
+    serial_uart = uart;
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SIM_JSON: SERIAL7 ready");
+}
+
+void JSON::output_servos_serial(const struct sitl_input &input)
+{
+    if (serial_uart == nullptr) {
+        return;
+    }
+
+    static_assert(sizeof(servo_packet_16) == 40, "Unexpected 16-channel packet size");
+    static_assert(sizeof(servo_packet_32) == 72, "Unexpected 32-channel packet size");
+
+    // Preserve a partially queued packet before taking another servo snapshot.
+    if (serial_tx_offset == serial_tx_len) {
+        if (SRV_Channels::have_32_channels()) {
+            servo_packet_32 pkt;
+            pkt.frame_rate = rate_hz;
+            pkt.frame_count = frame_counter;
+            for (uint8_t i = 0; i < 32; i++) {
+                pkt.pwm[i] = input.servos[i];
+            }
+            serial_tx_len = sizeof(pkt);
+            memcpy(serial_tx_buffer, &pkt, sizeof(pkt));
+        } else {
+            servo_packet_16 pkt;
+            pkt.frame_rate = rate_hz;
+            pkt.frame_count = frame_counter;
+            for (uint8_t i = 0; i < 16; i++) {
+                pkt.pwm[i] = input.servos[i];
+            }
+            serial_tx_len = sizeof(pkt);
+            memcpy(serial_tx_buffer, &pkt, sizeof(pkt));
+        }
+        serial_tx_offset = 0;
+    }
+
+    const size_t tx_space = serial_uart->txspace();
+    const size_t n = MIN(serial_tx_len - serial_tx_offset, tx_space);
+    if (n == 0) {
+        return;
+    }
+    // One bounded write per update; advance only by bytes accepted by the HAL.
+    const size_t written = serial_uart->write_locked(serial_tx_buffer + serial_tx_offset,
+                                                     n, serial_lock_key);
+    serial_tx_offset += written;
+}
+
+void JSON::receive_serial_fdm()
+{
+    if (serial_uart == nullptr) {
+        return;
+    }
+
+    // Snapshot a bounded budget: continuous input cannot monopolise update().
+    const uint32_t available = serial_uart->available_locked(serial_lock_key);
+    uint32_t remaining = MIN(available, uint32_t(4096));
+    uint8_t chunk[128];
+    while (remaining > 0) {
+        const ssize_t n = serial_uart->read_locked(chunk, MIN(remaining, uint32_t(sizeof(chunk))), serial_lock_key);
+        if (n <= 0) {
+            return;
+        }
+        remaining -= n;
+        for (ssize_t i = 0; i < n; i++) {
+            const uint8_t c = chunk[i];
+            if (c == '\n') {
+                if (!serial_rx_discard) {
+                    if (sensor_buffer_len > 0 && sensor_buffer[sensor_buffer_len - 1] == '\r') {
+                        sensor_buffer_len--;
+                    }
+                    if (sensor_buffer_len > 0) {
+                        sensor_buffer[sensor_buffer_len] = 0;
+                        const uint64_t mask = decode_fdm((const char *)sensor_buffer);
+                        if (mask != 0) {
+                            apply_fdm(mask);
+                            update_mag_field_bf();
+                        }
+                    }
+                }
+                sensor_buffer_len = 0;
+                serial_rx_discard = false;
+            } else if (!serial_rx_discard) {
+                // Reject embedded NULs as well as oversized lines; resync at LF.
+                if (c == 0 || sensor_buffer_len >= sizeof(sensor_buffer) - 1) {
+                    sensor_buffer_len = 0;
+                    serial_rx_discard = true;
+                } else {
+                    sensor_buffer[sensor_buffer_len++] = c;
+                }
+            }
+        }
+    }
+}
+#endif
+
+#if !AP_SIM_JSON_SERIAL_ENABLED
 /*
     Decode and send servos
 */
@@ -136,6 +283,8 @@ void JSON::output_servos(const struct sitl_input &input)
     }
 }
 
+
+#endif // !AP_SIM_JSON_SERIAL_ENABLED
 
 /*
     very simple JSON parser for sensor data
@@ -203,7 +352,9 @@ uint64_t JSON::parse_sensors(const char *json)
         if (!p) {
             // we don't have this sensor
             if (key.required) {
+#if !AP_SIM_JSON_SERIAL_ENABLED
                 printf("Failed to find %s\n", key.section);
+#endif
                 return 0;
             }
             continue;
@@ -214,7 +365,9 @@ uint64_t JSON::parse_sensors(const char *json)
         p = strstr(p, key.key);
         if (!p) {
             if (key.required) {
+#if !AP_SIM_JSON_SERIAL_ENABLED
                 printf("Failed to find key %s/%s\n", key.section, key.key);
+#endif
                 return 0;
             }
             continue;
@@ -243,8 +396,12 @@ uint64_t JSON::parse_sensors(const char *json)
             case DATA_VECTOR3F: {
                 Vector3<float> v;
                 if (!parse_array(p, v, ARRAY_SIZE(v))) {
+#if AP_SIM_JSON_SERIAL_ENABLED
+                    return 0;
+#else
                     printf("Failed to parse Vector3f for %s/%s\n", key.section, key.key);
                     return received_bitmask;
+#endif
                 }
                 Vector3f *tv = (Vector3<float> *)key.ptr;
                 *tv = v;
@@ -255,8 +412,12 @@ uint64_t JSON::parse_sensors(const char *json)
             case DATA_VECTOR3D: {
                 Vector3<double> v;
                 if (!parse_array(p, v, ARRAY_SIZE(v))) {
+#if AP_SIM_JSON_SERIAL_ENABLED
+                    return 0;
+#else
                     printf("Failed to parse Vector3d for %s/%s\n", key.section, key.key);
                     return received_bitmask;
+#endif
                 }
                 Vector3d *tv = (Vector3d *)key.ptr;
                 *tv = v;
@@ -267,8 +428,12 @@ uint64_t JSON::parse_sensors(const char *json)
             case QUATERNION: {
                 VectorN<float, 4> v;
                 if (!parse_array(p, v, ARRAY_SIZE(v))) {
+#if AP_SIM_JSON_SERIAL_ENABLED
+                    return 0;
+#else
                     printf("Failed to parse Vector4f for %s/%s\n", key.section, key.key);
                     return received_bitmask;
+#endif
                 }
                 Quaternion *tv = static_cast<Quaternion*>(key.ptr);
                 tv->q1 = v[0];
@@ -300,6 +465,7 @@ uint64_t JSON::parse_sensors(const char *json)
     Receive new sensor data from simulator
     This is a blocking function
 */
+#if !AP_SIM_JSON_SERIAL_ENABLED
 void JSON::recv_fdm(const struct sitl_input &input)
 {
     const auto receive_sensor_packet = [this]() -> ssize_t {
@@ -357,19 +523,46 @@ void JSON::recv_fdm(const struct sitl_input &input)
         return;
     }
 
-    const uint64_t received_bitmask = parse_sensors((const char *)(p1+1));
+    const uint64_t received_bitmask = decode_fdm((const char *)(p1+1));
     if (received_bitmask == 0) {
-        // did not receive one of the mandatory fields
-        printf("Did not contain all mandatory fields\n");
         return;
     }
+
+    memmove(sensor_buffer, p2, sensor_buffer_len - (p2 - sensor_buffer));
+    sensor_buffer_len = sensor_buffer_len - (p2 - sensor_buffer);
+
+    apply_fdm(received_bitmask);
+}
+#endif // !AP_SIM_JSON_SERIAL_ENABLED
+
+uint64_t JSON::decode_fdm(const char *json)
+{
+    const uint64_t received_bitmask = parse_sensors(json);
+    if (received_bitmask == 0) {
+        // did not receive one of the mandatory fields
+#if !AP_SIM_JSON_SERIAL_ENABLED
+        printf("Did not contain all mandatory fields\n");
+#endif
+        return 0;
+    }
+
+#if AP_SIM_JSON_SERIAL_ENABLED
+    for (uint16_t i = 0; i < ARRAY_SIZE(keytable); i++) {
+        if (keytable[i].required && (received_bitmask & (1ULL << i)) == 0) {
+            return 0;
+        }
+    }
+#endif
 
     // Must get either attitude or quaternion fields
     if ((received_bitmask & (EULER_ATT | QUAT_ATT)) == 0) {
+#if !AP_SIM_JSON_SERIAL_ENABLED
         printf("Did not receive attitude or quaternion\n");
-        return;
+#endif
+        return 0;
     }
 
+#if !AP_SIM_JSON_SERIAL_ENABLED
     if (received_bitmask != last_received_bitmask) {
         // some change in the message we have received, print what we got
         printf("\nJSON received:\n");
@@ -386,11 +579,14 @@ void JSON::recv_fdm(const struct sitl_input &input)
         }
         printf("\n");
     }
+#endif
     last_received_bitmask = received_bitmask;
 
-    memmove(sensor_buffer, p2, sensor_buffer_len - (p2 - sensor_buffer));
-    sensor_buffer_len = sensor_buffer_len - (p2 - sensor_buffer);
+    return received_bitmask;
+}
 
+void JSON::apply_fdm(uint64_t received_bitmask)
+{
     accel_body = state.imu.accel_body;
     gyro = state.imu.gyro;
     velocity_ef = state.velocity;
@@ -612,6 +808,11 @@ void JSON::recv_fdm(const struct sitl_input &input)
 */
 void JSON::update(const struct sitl_input &input)
 {
+#if AP_SIM_JSON_SERIAL_ENABLED
+    init_serial();
+    output_servos_serial(input);
+    receive_serial_fdm();
+#else
     // send to JSON model
     output_servos(input);
 
@@ -634,6 +835,7 @@ void JSON::update(const struct sitl_input &input)
         printf("FPS %.2f\n", rate_hz); // this is instantaneous rather than any clever average
     }
 #endif
+#endif // AP_SIM_JSON_SERIAL_ENABLED
 }
 
 #endif  // AP_SIM_JSON_ENABLED

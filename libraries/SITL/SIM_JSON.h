@@ -18,7 +18,18 @@
 
 #if AP_SIM_JSON_ENABLED
 
+// Research-only transport selection; UDP remains the default.
+#ifndef AP_SIM_JSON_SERIAL_ENABLED
+#define AP_SIM_JSON_SERIAL_ENABLED 0
+#endif
+
+#if AP_SIM_JSON_SERIAL_ENABLED && !(AP_SIM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS)
+#error "SIM_JSON Serial transport requires Simulation-on-Hardware with ChibiOS"
+#endif
+
+#if !AP_SIM_JSON_SERIAL_ENABLED
 #include <AP_HAL/utility/Socket.h>
+#endif
 #include "SIM_Aircraft.h"
 
 #define SITL_JSON_DEBUG 0
@@ -62,7 +73,20 @@ private:
     // default connection_info_.sitl_ip_port
     uint16_t control_port = 9002;
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+#if AP_SIM_JSON_SERIAL_ENABLED
+    // Research Serial transport.
+    AP_HAL::UARTDriver *serial_uart = nullptr;
+    bool serial_init_attempted = false;
+    static constexpr uint32_t serial_lock_key = 0x4a534f4e; // JSON
+    void init_serial();
+    void output_servos_serial(const struct sitl_input &input);
+    void receive_serial_fdm();
+    bool serial_rx_discard = false;
+    uint8_t serial_tx_buffer[sizeof(servo_packet_32)];
+    size_t serial_tx_len = 0;
+    size_t serial_tx_offset = 0;
+
+#elif CONFIG_HAL_BOARD == HAL_BOARD_SITL
     SocketAPM_native sock;
 #else
     // sim-on-hardware
@@ -77,14 +101,23 @@ private:
     bool initial_fdm_received = false;
 #endif
 
+#if !AP_SIM_JSON_SERIAL_ENABLED
     void output_servos(const struct sitl_input &input);
     void recv_fdm(const struct sitl_input &input);
+#endif
 
     uint64_t parse_sensors(const char *json);
+    uint64_t decode_fdm(const char *json);
+    void apply_fdm(uint64_t received_bitmask);
 
     // buffer for parsing pose data in JSON format
+#if AP_SIM_JSON_SERIAL_ENABLED
+    uint8_t sensor_buffer[4096]; // Maximum 4095 bytes per line, plus NUL.
+    uint32_t sensor_buffer_len = 0;
+#else
     uint8_t sensor_buffer[65000];
     uint32_t sensor_buffer_len;
+#endif
 
     enum data_type {
         DATA_UINT64,
