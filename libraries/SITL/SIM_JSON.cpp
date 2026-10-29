@@ -72,6 +72,9 @@ JSON::JSON(const char *frame_str) :
 #endif
 {
     printf("Starting SITL: JSON\n");
+#if AP_SIM_JSON_SERIAL_ENABLED
+    rangefinder_has_updates = true;
+#endif
 
     const char *colon = strchr(frame_str, ':');
     if (colon) {
@@ -669,11 +672,25 @@ void JSON::apply_fdm(uint64_t received_bitmask)
     update_position();
 
     // update range finder distances
+    const uint32_t range_update_ms = AP_HAL::millis();
     for (uint8_t i=0; i<6; i++) {
         if ((received_bitmask & (RNG_1 << i)) == 0) {
             continue;
         }
         rangefinder_m[i] = state.rng[i];
+        if (rangefinder_has_updates) {
+            const uint16_t sensor_mask = 1U << i;
+            rangefinder_seen_mask |= sensor_mask;
+            rangefinder_last_update_ms[i] = range_update_ms;
+            const bool valid = ((received_bitmask & RANGE_VALID_MASK) == 0 ||
+                                (state.range_valid_mask & sensor_mask) != 0) &&
+                               !isnan(state.rng[i]) && !isinf(state.rng[i]);
+            if (valid) {
+                rangefinder_valid_mask |= sensor_mask;
+            } else {
+                rangefinder_valid_mask &= ~sensor_mask;
+            }
+        }
     }
 
     // update wind vane

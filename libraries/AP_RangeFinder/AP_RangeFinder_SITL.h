@@ -35,6 +35,8 @@ protected:
     }
 
     uint8_t _instance;
+    uint32_t _last_update_ms = 0;
+    bool _have_sample = false;
 
 };
 

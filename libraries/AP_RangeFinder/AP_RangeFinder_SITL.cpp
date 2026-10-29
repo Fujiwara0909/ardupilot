@@ -19,6 +19,8 @@
 #include <AP_HAL/AP_HAL.h>
 #include <SITL/SITL.h>
 
+static constexpr uint32_t RANGEFINDER_SIM_TIMEOUT_MS = 500;
+
 /*
   constructor - registers instance at top RangeFinder driver
  */
@@ -33,6 +35,26 @@ AP_RangeFinder_SITL::AP_RangeFinder_SITL(RangeFinder::RangeFinder_State &_state,
 void AP_RangeFinder_SITL::update(void)
 {
     const float dist = AP::sitl()->get_rangefinder(_instance);
+
+    bool seen, valid;
+    uint32_t last_update_ms;
+    if (AP::sitl()->get_rangefinder_update(_instance, seen, valid, last_update_ms)) {
+        if (!seen || !valid || isnan(dist) || isinf(dist) ||
+            AP_HAL::millis() - last_update_ms > RANGEFINDER_SIM_TIMEOUT_MS) {
+            _have_sample = false;
+            set_status(RangeFinder::Status::NoData);
+            return;
+        }
+        if (_have_sample && last_update_ms == _last_update_ms) {
+            return;
+        }
+        _have_sample = true;
+        _last_update_ms = last_update_ms;
+        state.distance_m = dist;
+        state.last_reading_ms = last_update_ms;
+        update_status();
+        return;
+    }
 
     // nan distance means nothing is connected
     if (isnan(dist) || isinf(dist)) {

@@ -438,6 +438,10 @@ void Aircraft::fill_fdm(struct sitl_fdm &fdm)
 
     // copy rangefinder
     memcpy(fdm.rangefinder_m, rangefinder_m, sizeof(fdm.rangefinder_m));
+    memcpy(fdm.rangefinder_last_update_ms, rangefinder_last_update_ms, sizeof(fdm.rangefinder_last_update_ms));
+    fdm.rangefinder_seen_mask = rangefinder_seen_mask;
+    fdm.rangefinder_valid_mask = rangefinder_valid_mask;
+    fdm.rangefinder_has_updates = rangefinder_has_updates;
 
     fdm.wind_vane_apparent.direction = wind_vane_apparent.direction;
     fdm.wind_vane_apparent.speed = wind_vane_apparent.speed;

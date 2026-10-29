@@ -252,6 +252,11 @@ protected:
 
     // Rangefinder
     float rangefinder_m[SITL_NUM_RANGEFINDERS];
+    // Optional receive metadata; other models retain the legacy sampling behaviour.
+    uint32_t rangefinder_last_update_ms[SITL_NUM_RANGEFINDERS] {};
+    uint16_t rangefinder_seen_mask = 0;
+    uint16_t rangefinder_valid_mask = 0;
+    bool rangefinder_has_updates = false;
 
     // Windvane apparent wind
     struct {

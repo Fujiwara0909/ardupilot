@@ -91,6 +91,10 @@ struct sitl_fdm {
 
     #define SITL_NUM_RANGEFINDERS 10
     float rangefinder_m[SITL_NUM_RANGEFINDERS];
+    uint32_t rangefinder_last_update_ms[SITL_NUM_RANGEFINDERS];
+    uint16_t rangefinder_seen_mask;
+    uint16_t rangefinder_valid_mask;
+    bool rangefinder_has_updates;
     float airspeed_raw_pressure[AIRSPEED_MAX_SENSORS];
 
     struct {
@@ -606,6 +610,9 @@ public:
 
     // get the rangefinder reading for the desired instance, returns -1 for no data
     float get_rangefinder(uint8_t instance);
+
+    // Returns true when the model supplies per-sensor receive metadata.
+    bool get_rangefinder_update(uint8_t instance, bool &seen, bool &valid, uint32_t &last_update_ms) const;
 
     float measure_distance_at_angle_bf(const Location &location, float angle) const;
 

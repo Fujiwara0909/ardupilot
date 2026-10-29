@@ -1782,6 +1782,22 @@ float SIM::get_rangefinder(uint8_t instance) {
     return nanf("");
 };
 
+bool SIM::get_rangefinder_update(uint8_t instance, bool &seen, bool &valid, uint32_t &last_update_ms) const
+{
+    if (!state.rangefinder_has_updates) {
+        return false;
+    }
+    seen = false;
+    valid = false;
+    last_update_ms = 0;
+    if (instance < ARRAY_SIZE(state.rangefinder_m)) {
+        seen = (state.rangefinder_seen_mask & (1U << instance)) != 0;
+        valid = (state.rangefinder_valid_mask & (1U << instance)) != 0;
+        last_update_ms = state.rangefinder_last_update_ms[instance];
+    }
+    return true;
+}
+
 float SIM::measure_distance_at_angle_bf(const Location &location, float angle) const
 {
     // should we populate state.rangefinder_m[...] from this?
